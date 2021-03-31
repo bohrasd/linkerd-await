@@ -41,6 +41,7 @@ struct Opt {
 }
 
 // From https://man.netbsd.org/sysexits.3
+const EX_USAGE: i32 = 64;
 const EX_OSERR: i32 = 71;
 
 #[tokio::main(flavor = "current_thread")]
@@ -53,41 +54,44 @@ async fn main() {
         args,
     } = Opt::from_args();
 
+    if shutdown && cmd.is_none() {
+        eprintln!("A command is required when --shutdown is specified");
+        std::process::exit(EX_USAGE);
+    }
+
     let authority = http::uri::Authority::from_str(&format!("localhost:{}", port))
         .expect("HTTP authority must be valid");
 
     // If linkerd is not explicitly disabled, wait until the proxy is ready
     // before running the application.
     match linkerd_disabled_reason() {
-        Some(reason) => eprintln!("Linkerd readiness check skipped: {}", reason),
+        Some(reason) => {
+            eprintln!("Linkerd readiness check skipped: {}", reason);
+        }
         None => {
             await_ready(authority.clone(), backoff).await;
 
             if shutdown {
-                let ex = if let Some(c) = cmd {
-                    // If shutdown is configured, fork the process and proxy
-                    // SIGTERM.
-                    Some(fork_with_sigterm(c, args).await)
-                } else {
-                    None
-                };
+                // If there is no command, exit immediately after the proxy becomes
+                // ready.
+                let cmd = cmd.expect("Command must be specified with --shutdown");
+
+                // If shutdown is configured, fork the process and proxy
+                // SIGTERM.
+                let ex = fork_with_sigterm(cmd, args).await;
 
                 send_shutdown(authority).await;
 
-                if let Some(ex) = ex {
-                    // Try to exit with the process's original exit code
-                    if let Ok(status) = ex {
-                        if let Some(code) = status.code() {
-                            std::process::exit(code);
-                        }
+                // Try to exit with the process's original exit code
+                if let Ok(status) = ex {
+                    if let Some(code) = status.code() {
+                        std::process::exit(code);
                     }
-
-                    // If we didn't get an exit code from the forked program,
-                    // fail with an OS error.
-                    std::process::exit(EX_OSERR);
                 }
 
-                return;
+                // If we didn't get an exit code from the forked program,
+                // fail with an OS error.
+                std::process::exit(EX_OSERR);
             }
         }
     }
